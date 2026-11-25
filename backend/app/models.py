@@ -519,3 +519,70 @@ class ModelRun(Base):
     weights: Mapped[dict] = mapped_column(JSONB, default=dict)
     calibration: Mapped[dict] = mapped_column(JSONB, default=dict)
     note: Mapped[str] = mapped_column(Text)
+
+
+# ---------------------------------------------------------------- 服务活动时间重建
+class SourceProfile(Base):
+    """来源画像（机构级报送特征）。
+
+    刻画一个报送机构的清算批次机制、服务时间/批次号完备性与延迟稳定性，
+    为“延迟反卷积”和“清算批次对账还原”两条重建路径提供适用性判断。
+    """
+    __tablename__ = "source_profile"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)  # PRF-A...
+    org_code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    org_name: Mapped[str] = mapped_column(String(128))
+    # daily_stable（每日稳定直报）/ batch_catchup（多日合并、固定批次补传）/
+    # service_time_reliable（无批次号但服务时间可靠）
+    report_mode: Mapped[str] = mapped_column(String(32), index=True)
+    # 是否持有清算批次号；批次清单元数据是否完整（可对账还原服务日）
+    has_batch_no: Mapped[bool] = mapped_column(Boolean, default=True)
+    batch_metadata_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    service_time_reliable: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 延迟机制是否稳定（经验分布可用于反卷积）；月末合并可能造成局部漂移
+    delay_mechanism_stable: Mapped[bool] = mapped_column(Boolean, default=True)
+    mechanism_desc: Mapped[str] = mapped_column(Text)
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("source_record.id"), nullable=True)
+
+
+class ClearingBatch(Base):
+    """清算批次清单：批次号 + 签收时间 + 清单声明的服务日/笔数，是对账还原依据。"""
+    __tablename__ = "clearing_batch"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_no: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    org_code: Mapped[str] = mapped_column(String(32), index=True)
+    signed_at: Mapped[datetime] = mapped_column(DateTime, index=True)  # 签收时间
+    seq_count: Mapped[int] = mapped_column(Integer, default=0)         # 批次内最大序号
+    declared_units: Mapped[int] = mapped_column(Integer, default=0)     # 清单声明活动笔数
+    # 元数据完整：批次号/签收/序号连续/服务日清单齐全，可高精度对账还原
+    metadata_complete: Mapped[bool] = mapped_column(Boolean, default=True)
+    # {"2026-03-05": {"visit": 14, "settlement": 12}, ...}
+    service_dates: Mapped[dict] = mapped_column(JSONB, default=dict)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ActivityRecord(Base):
+    """来源画像明细行：机构 / 清算批次 / 服务发生时间 / 签收时间 / 批次内序号。
+
+    一条 = 某机构某服务日（或某未知服务时间）某类活动的若干笔汇总。
+    service_date 为空表示“服务时间缺失/未知”，重建时只进 unknown 桶，
+    绝不回填到月末或任何具体日期。
+    """
+    __tablename__ = "activity_record"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    org_code: Mapped[str] = mapped_column(String(32), index=True)
+    # visit（就诊）/ settlement（结算）
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    batch_no: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 服务发生时间；NULL = 未知，禁止分配到月末
+    service_date: Mapped[datetime | None] = mapped_column(Date, nullable=True, index=True)
+    # 签收（平台接收）时间，接收日曲线按它统计
+    signed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    batch_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    unit_count: Mapped[int] = mapped_column(Integer, default=1)
+    amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    source_id: Mapped[int | None] = mapped_column(
+        ForeignKey("source_record.id"), nullable=True)

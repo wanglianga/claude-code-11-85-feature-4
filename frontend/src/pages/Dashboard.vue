@@ -66,6 +66,7 @@
       </el-steps>
       <div class="flex gap8 mt12">
         <el-button @click="$router.push('/patterns')">前往模式排序</el-button>
+        <el-button type="primary" plain @click="$router.push('/activity')">服务活动时间重建（A/B/C 峰值校正）</el-button>
         <el-button @click="$router.push('/explorer?case=C-001')">在图扩展中查看 P1</el-button>
         <el-button @click="$router.push('/snapshots')">快照复演 / 触发变更</el-button>
       </div>

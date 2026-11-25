@@ -12,6 +12,7 @@
                text-color="#b9c8e6" active-text-color="#ffffff">
         <el-menu-item index="/dashboard"><el-icon><DataAnalysis /></el-icon><span>总览 / 验收剧本</span></el-menu-item>
         <el-menu-item index="/sources"><el-icon><Notebook /></el-icon><span>来源账</span></el-menu-item>
+        <el-menu-item index="/activity"><el-icon><Timer /></el-icon><span>活动时间重建</span></el-menu-item>
         <el-menu-item index="/identity"><el-icon><Avatar /></el-icon><span>身份解析</span></el-menu-item>
         <el-menu-item index="/explorer"><el-icon><Share /></el-icon><span>受限图扩展</span></el-menu-item>
         <el-menu-item index="/patterns"><el-icon><MagicStick /></el-icon><span>模式与排序</span></el-menu-item>

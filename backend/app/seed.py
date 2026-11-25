@@ -14,6 +14,7 @@ from datetime import datetime as DT
 
 from .database import Base, SessionLocal, engine
 from .models import (
+    ActivityRecord,
     Appeal,
     BedService,
     Case,
@@ -33,11 +34,13 @@ from .models import (
     Referral,
     Schedule,
     Settlement,
+    SourceProfile,
     SourceRecord,
     StockTransfer,
     Supply,
     User,
     Visit,
+    ClearingBatch,
 )
 from .security import hash_password
 
@@ -577,9 +580,179 @@ CASE_META = [
 ]
 
 
+# ------------------------------------------------------------ 服务活动时间重建
+ACT_ORGS = {
+    "H-A": "安和社区卫生服务中心（样例A·每日直报）",
+    "H-B": "博济门诊部（样例B·周末压批周一补传）",
+    "H-C": "慈安诊所（样例C·服务时间可靠/无批次号）",
+}
+
+
+def _act_count(org: str, d: D, kind: str) -> int:
+    """确定性的“真实”日活动量：基线 + 周末略低 + 3/12-13 真实就诊高峰。"""
+    base = {"H-A": 15, "H-B": 13, "H-C": 11}[org]
+    n = base + (d.day % 5)
+    if d.weekday() >= 5:       # 周末略低，但仍有不少诊疗
+        n -= 3
+    if d.weekday() == 2:
+        n += 2
+    if d in (D(2026, 3, 12), D(2026, 3, 13)):
+        n += 16                # 一次真实服务高峰（流感/随访叠加）
+    if kind == "settlement":
+        n = n - 1 - (d.day % 2)
+    return max(4, n)
+
+
+def _split_largest_remainder(total: int, weights: list[float]) -> list[int]:
+    raw = [total * w for w in weights]
+    floors = [int(x) for x in raw]
+    rest = total - sum(floors)
+    order = sorted(range(len(weights)),
+                   key=lambda i: (raw[i] - floors[i]), reverse=True)
+    for k in range(rest):
+        floors[order[k % len(order)]] += 1
+    return floors
+
+
+def seed_activity_time(db):
+    """A 每日稳定；B 四天周末压到周一（含月末合并批）；C 无批次号、服务时间可靠。
+
+    另在 A 放 7 笔月末签收但服务时间缺失的记录：必须保留未知，不得归到 3/31。
+    """
+    start, end = D(2026, 3, 1), D(2026, 3, 31)
+    days = [start + __import__("datetime").timedelta(days=i)
+            for i in range((end - start).days + 1)]
+
+    # 三个报送来源的来源账记录（可引用），画像/明细挂 source_id
+    feed_src = {}
+    for org, sysname in (("H-A", "机构直报-A"), ("H-B", "清算平台-B"),
+                         ("H-C", "机构直报-C")):
+        s = src(db, f"SRC-ACT-{org[-1]}", "activity_feed", org, sysname,
+                f"报送来源画像 {org} / 接口台账", D(2026, 1, 1),
+                received=dt(2026, 3, 31, 23, 0),
+                payload={"feature": "service_activity_reconstruction"})
+        feed_src[org] = s.id
+
+    profiles = [
+        SourceProfile(
+            code="PRF-A", org_code="H-A", org_name=ACT_ORGS["H-A"],
+            report_mode="daily_stable", has_batch_no=True,
+            batch_metadata_complete=True, service_time_reliable=True,
+            delay_mechanism_stable=True, source_id=feed_src["H-A"],
+            mechanism_desc="每个服务日当晚稳定直报，延迟约 0 天，日清算批次清单完整；"
+                           "仅一笔月末调整批缺少服务时间。"),
+        SourceProfile(
+            code="PRF-B", org_code="H-B", org_name=ACT_ORGS["H-B"],
+            report_mode="batch_catchup", has_batch_no=True,
+            batch_metadata_complete=True, service_time_reliable=True,
+            delay_mechanism_stable=True, source_id=feed_src["H-B"],
+            mechanism_desc="周一签收上周四至周日四天（“周末四天同批周一补传”），"
+                           "周三签收周一至周三；月末把 3/26–3/31 合并为清算大批次。"
+                           "压批日历稳定，批次清单完整，可高精度对账还原。"),
+        SourceProfile(
+            code="PRF-C", org_code="H-C", org_name=ACT_ORGS["H-C"],
+            report_mode="service_time_reliable", has_batch_no=False,
+            batch_metadata_complete=False, service_time_reliable=True,
+            delay_mechanism_stable=True, source_id=feed_src["H-C"],
+            mechanism_desc="无清算批次号/批次清单，但每条记录服务发生时间可靠；"
+                           "到达延迟为平滑的 0–2 天短尾。不能套用 B 的批次校正。"),
+    ]
+    db.add_all(profiles)
+    db.flush()
+
+    seq_counter = {}
+
+    def add_line(code, org, kind, service_date, signed, batch_no, unit, seq=None):
+        db.add(ActivityRecord(
+            code=code, org_code=org, kind=kind, batch_no=batch_no,
+            service_date=service_date,
+            signed_at=signed if isinstance(signed, DT)
+            else DT.combine(signed, DT.min.time()),
+            batch_seq=seq, unit_count=unit, source_id=feed_src[org]))
+
+    # ---------- A：每日批次，当晚签收 ----------
+    for d in days:
+        bno = f"QPA-{d:%Y%m%d}"
+        seq = 0
+        for kind in ("visit", "settlement"):
+            seq += 1
+            add_line(f"ACT-A-{d:%m%d}-{kind[0].upper()}", "H-A", kind, d,
+                     dt(d.year, d.month, d.day, 18, 0), bno,
+                     _act_count("H-A", d, kind), seq)
+        db.add(ClearingBatch(
+            batch_no=bno, org_code="H-A",
+            signed_at=dt(d.year, d.month, d.day, 18, 0), seq_count=2,
+            declared_units=sum(_act_count("H-A", d, k)
+                               for k in ("visit", "settlement")),
+            metadata_complete=True,
+            service_dates={d.isoformat(): {
+                "visit": _act_count("H-A", d, "visit"),
+                "settlement": _act_count("H-A", d, "settlement")}}))
+
+    # A 的月末调整批：3 行共 7 笔，签收 3/31，但服务时间缺失（未知，禁止归到月末）
+    unk_units = [2, 2, 3]
+    for i, u in enumerate(unk_units, start=1):
+        add_line(f"ACT-A-UNK-{i}", "H-A", "visit", None,
+                 dt(2026, 3, 31, 19, 30), "QPA-MEND-0331", u, i)
+    db.add(ClearingBatch(
+        batch_no="QPA-MEND-0331", org_code="H-A",
+        signed_at=dt(2026, 3, 31, 19, 30), seq_count=3, declared_units=7,
+        metadata_complete=False, service_dates={},
+        note="月末调整补传：有批次号与序号，但缺服务日清单，无法对账定日，保留未知。"))
+
+    # ---------- B：固定压批日历 + 月末合并批 ----------
+    b_groups = [
+        ("W0",  D(2026, 3, 4), [D(2026, 3, d) for d in (1, 2, 3, 4)]),
+        ("WE1", D(2026, 3, 9), [D(2026, 3, d) for d in (5, 6, 7, 8)]),
+        ("WM1", D(2026, 3, 11), [D(2026, 3, d) for d in (9, 10, 11)]),
+        ("WE2", D(2026, 3, 16), [D(2026, 3, d) for d in (12, 13, 14, 15)]),
+        ("WM2", D(2026, 3, 18), [D(2026, 3, d) for d in (16, 17, 18)]),
+        ("WE3", D(2026, 3, 23), [D(2026, 3, d) for d in (19, 20, 21, 22)]),
+        ("WM3", D(2026, 3, 25), [D(2026, 3, d) for d in (23, 24, 25)]),
+        ("EOF", D(2026, 3, 31), [D(2026, 3, d) for d in range(26, 32)]),
+    ]
+    for suffix, sign_day, gdates in b_groups:
+        bno = f"QPB-{suffix}-03"
+        seq = 0
+        manifest = {}
+        declared = 0
+        for gd in gdates:
+            v = _act_count("H-B", gd, "visit")
+            s = _act_count("H-B", gd, "settlement")
+            manifest[gd.isoformat()] = {"visit": v, "settlement": s}
+            declared += v + s
+            for kind, unit in (("visit", v), ("settlement", s)):
+                seq += 1
+                add_line(f"ACT-B-{suffix}-{gd:%m%d}-{kind[0].upper()}",
+                         "H-B", kind, gd,
+                         dt(sign_day.year, sign_day.month, sign_day.day, 10, 0),
+                         bno, unit, seq)
+        db.add(ClearingBatch(
+            batch_no=bno, org_code="H-B",
+            signed_at=dt(sign_day.year, sign_day.month, sign_day.day, 10, 0),
+            seq_count=seq, declared_units=declared, metadata_complete=True,
+            service_dates=manifest,
+            note=("周末四天同批周一补传" if suffix.startswith("WE")
+                  else "月末合并清算批" if suffix == "EOF" else None)))
+
+    # ---------- C：无批次号；服务时间可靠；平滑 0/1/2 天短延迟 ----------
+    for d in days:
+        for kind in ("visit", "settlement"):
+            total = _act_count("H-C", d, kind)
+            parts = _split_largest_remainder(total, [0.6, 0.3, 0.1])
+            for lag, unit in enumerate(parts):
+                if unit <= 0:
+                    continue
+                sign = d + __import__("datetime").timedelta(days=lag)
+                add_line(f"ACT-C-{d:%m%d}-{kind[0].upper()}-L{lag}",
+                         "H-C", kind, d,
+                         dt(sign.year, sign.month, sign.day, 15, 0),
+                         None, unit, None)
+    db.flush()
+
+
 def run_seed(reset: bool = True):
     """建表并写入全部演示数据；reset=True 时先 drop_all。"""
-    # 延迟导入避免循环依赖
     from .services import counterevidence as ce
     from .services import graph_builder, graphmodel, identity, patterns, projection, snapshot
 
@@ -601,6 +774,7 @@ def run_seed(reset: bool = True):
         seed_central(db)
         seed_referral(db)
         seed_pattern_configs(db)
+        seed_activity_time(db)
         db.commit()
 
         # 1) 身份簇 v1

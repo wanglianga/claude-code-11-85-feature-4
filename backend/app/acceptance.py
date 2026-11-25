@@ -201,6 +201,157 @@ def run_acceptance(db: Session) -> dict:
          "policies": len(snap1.policy_versions) if snap1 else 0,
          "judgment_version": j1.version, "snapshot_no": j1.snapshot_no}))
 
+    # 11) 服务活动时间重建：A/B/C 来源画像与五要素 ------------------------
+    from .models import ActivityRecord, ClearingBatch, SourceProfile
+    from .services import activity as act
+
+    profs = {p.org_code: p for p in db.query(SourceProfile).all()}
+    pa, pb, pc = profs.get("H-A"), profs.get("H-B"), profs.get("H-C")
+    b_missing_seq = db.query(ActivityRecord).filter(
+        ActivityRecord.org_code == "H-B",
+        ActivityRecord.batch_seq.is_(None)).count()
+    missing_signed = db.query(ActivityRecord).filter(
+        ActivityRecord.signed_at.is_(None)).count()
+    visit_n = db.query(ActivityRecord).filter_by(kind="visit").count()
+    settle_n = db.query(ActivityRecord).filter_by(kind="settlement").count()
+    rs_settle = act.reconstruct(db, "ALL", "settlement")
+    profiles_ok = (
+        pa and pb and pc
+        and pa.report_mode == "daily_stable"
+        and pb.report_mode == "batch_catchup" and pb.has_batch_no
+        and pb.batch_metadata_complete
+        and pc.report_mode == "service_time_reliable"
+        and pc.has_batch_no is False and pc.service_time_reliable
+        and b_missing_seq == 0 and missing_signed == 0
+        and visit_n > 60 and settle_n > 60
+        and len(rs_settle["direct_daily"]) == 31
+        and rs_settle["totals"]["known_service_units"] > 0)
+    checks.append(_chk(
+        "activity_profiles", "活动重建：A每日/B压批/C无批次 三画像与机构·批次·服务时间·签收·序号齐全",
+        profiles_ok,
+        "H-A daily_stable；H-B batch_catchup+完整批次+序号；H-C 无批次但服务时间可靠；就诊/结算两类",
+        {"profiles": sorted(profs), "B缺序号行": b_missing_seq,
+         "缺签收时间行": missing_signed, "visit_rows": visit_n,
+         "settlement_rows": settle_n}))
+
+    # 12) 接收日峰值 vs 校正后真实服务峰值分离 -----------------------------
+    rb = act.reconstruct(db, "H-B", "visit")
+    axis_b = rb["arrival_axis"]
+    i_recv = axis_b.index("2026-03-16")
+    i_svc = rb["service_axis"].index("2026-03-16")
+    i_wed2 = rb["service_axis"].index("2026-03-13")
+    we2 = db.query(ClearingBatch).filter_by(batch_no="QPB-WE2-03").first()
+    we2_visit = sum(v.get("visit", 0) for v in (we2.service_dates or {}).values())
+    b_peak = rb["peaks"]
+    peak_ok = (
+        we2 is not None and we2.metadata_complete
+        and rb["received_daily"][i_recv] == we2_visit
+        and rb["received_daily"][i_recv] >= 4 * rb["direct_daily"][i_svc]
+        and b_peak["raw_peak"]["date"] == "2026-03-16"
+        and b_peak["raw_peak_attenuation"] is not None
+        and b_peak["raw_peak_attenuation"] >= 0.7
+        and b_peak["service_peak"]["date"] in ("2026-03-12", "2026-03-13")
+        and b_peak["peak_shift"]["from"] != b_peak["peak_shift"]["to"]
+        and any(p["verdict"] == "transmission_batch_peak"
+                for p in rb["peaks"]["transmission_peaks"])
+        and any(p["verdict"] == "real_service_peak"
+                for p in rb["peaks"]["real_peaks"]))
+    checks.append(_chk(
+        "activity_peak_separation",
+        "峰值分离：B 的 3/16 接收峰=周末四天压批，校正后落到 3/12-13 真实服务峰",
+        peak_ok,
+        "3/16 接收量==QPB-WE2 清单量且≥当天真实服务4倍；衰减≥70%；真峰在3/12-13；两类解释齐全",
+        {"recv_0316": rb["received_daily"][i_recv],
+         "we2_manifest_visit": we2_visit,
+         "service_0316": rb["direct_daily"][i_svc],
+         "service_0313": rb["direct_daily"][i_wed2],
+         "attenuation": b_peak["raw_peak_attenuation"],
+         "raw_peak": b_peak["raw_peak"], "service_peak": b_peak["service_peak"]}))
+
+    # 13) 两条方法估计同一目标期间 + 不确定范围，批次更窄 -------------------
+    dv, bm = rb["deconv"], rb["batch"]
+    same_window = (len(dv["daily"]) == len(bm["daily"]) == 31
+                   and rb["target"]["start"] == "2026-03-01"
+                   and rb["target"]["end"] == "2026-03-31")
+    coverage_ok = (rb["coverage"]["target_days"] == 31
+                   and rb["coverage"]["direct_evidenced_days"] == 31
+                   and rb["coverage"]["direct_coverage_ratio"] == 1.0
+                   and rb["coverage"]["deconv_observable_through"])
+    ordering = (dv["total"]["low"] <= dv["total"]["estimate"] <= dv["total"]["high"]
+                and bm["total"]["low"] <= bm["total"]["estimate"] <= bm["total"]["high"])
+    mass_ok = abs(dv["total"]["estimate"]
+                  - rb["totals"]["known_service_units"]) <= 1
+    batch_exact = bm["available"] and bm["total"]["estimate"] == 477 \
+        and bm["total"]["low"] == bm["total"]["high"] == 477
+    narrower = ((bm["total"]["high"] - bm["total"]["low"])
+                < (dv["total"]["high"] - dv["total"]["low"]))
+    methods_ok = (same_window and coverage_ok and ordering and mass_ok
+                  and batch_exact and narrower)
+    checks.append(_chk(
+        "activity_two_methods",
+        "两法同期：延迟反卷积与批次对账都估计 3 月服务量并给区间与覆盖区间，完整批次精确且区间更窄",
+        methods_ok,
+        "两法均 31 天同一目标期；直接证据覆盖31/31；反卷积总质量守恒≈477；批次=477 点区间；批次宽度<反卷积",
+        {"target": rb["target"], "coverage": rb["coverage"],
+         "deconv_total": dv["total"],
+         "batch_total": bm["total"],
+         "deconv_width": dv["total"]["high"] - dv["total"]["low"],
+         "batch_width": bm["total"]["high"] - bm["total"]["low"]}))
+
+    # 14) C 不能套用 B 的批次校正 ------------------------------------------
+    rc = act.reconstruct(db, "H-C", "visit")
+    pc_obj = db.query(SourceProfile).filter_by(org_code="H-C").first()
+    guard = act.why_cannot_transfer_batch("H-B", pc_obj)
+    c_batch_rows = db.query(ClearingBatch).filter_by(org_code="H-C").count()
+    c_null_batch = db.query(ActivityRecord).filter(
+        ActivityRecord.org_code == "H-C",
+        ActivityRecord.batch_no.isnot(None)).count()
+    c_ok = (rc["batch"]["available"] is False
+            and rc["batch"]["reason_code"] == "no_batch_no"
+            and c_batch_rows == 0 and c_null_batch == 0
+            and guard["allowed"] is False
+            and guard["reason_code"] == "target_has_no_batch_no"
+            and rc["totals"]["known_service_units"] > 0
+            and any(o["org_code"] == "H-C" and o["reliability"] == "high"
+                    for o in rc["deconv"]["by_org"]))
+    checks.append(_chk(
+        "activity_c_no_batch_guard",
+        "C 防护：无批次号→批次对账不可用，且明确禁止照搬 B 的周一/四天批次校正",
+        c_ok,
+        "C batch.available=false/no_batch_no；跨机构套用被 guard 拒绝；C 靠可靠服务时间/自身平滑核",
+        {"batch": rc["batch"]["reason_code"], "clearing_batches": c_batch_rows,
+         "rows_with_batch_no": c_null_batch, "guard": guard["reason_code"],
+         "guard_reason": guard["reason"]}))
+
+    # 15) 缺失服务时间保留未知，不分配到月末 --------------------------------
+    ra = act.reconstruct(db, "H-A", "visit")
+    unk_db = db.query(ActivityRecord).filter(
+        ActivityRecord.service_date.is_(None)).all()
+    unknown_rows = [r for r in unk_db if r.kind == "visit"]
+    unk_units = sum(r.unit_count for r in unknown_rows)
+    unk_service_contrib = sum(act._service_by_date(unknown_rows, act.daterange(
+        act.TARGET_START, act.TARGET_END)))
+    i_0331 = ra["service_axis"].index("2026-03-31")
+    unknown_ok = (
+        unk_units == 7 and ra["unknown"]["units"] == 7
+        and ra["unknown"]["by_signoff"].get("2026-03-31") == 7
+        and unk_service_contrib == 0
+        and sum(ra["direct_daily"]) == ra["totals"]["known_service_units"]
+        and ra["totals"]["all_units"] - ra["totals"]["known_service_units"] == 7
+        and ra["direct_daily"][i_0331] > 0)
+    checks.append(_chk(
+        "activity_unknown_preserved",
+        "缺失服务时间：7 笔月末签收但服务时间未知，只入 unknown，不分配到 3/31 或任何日",
+        unknown_ok,
+        "unknown=7 且均签收 3/31；未知行对所有服务日贡献=0；direct 合计=known=539，all=546",
+        {"unknown_units": unk_units,
+         "by_signoff": ra["unknown"]["by_signoff"],
+         "unknown_service_day_contribution": unk_service_contrib,
+         "direct_sum": sum(ra["direct_daily"]),
+         "known": ra["totals"]["known_service_units"],
+         "all": ra["totals"]["all_units"],
+         "direct_0331_not_dumped": ra["direct_daily"][i_0331]}))
+
     passed = sum(1 for c in checks if c["passed"])
     return {"overall": passed == len(checks), "passed": passed,
             "total": len(checks), "checks": checks}

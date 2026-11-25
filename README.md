@@ -17,6 +17,7 @@
 
 | 题目要求 | 实现位置 |
 | --- | --- |
+| **服务活动时间重建**：来源画像存机构/清算批次/服务发生时间/签收时间/批次内序号；分机构延迟模型；按服务时点重建日级就诊/结算活动与覆盖区间；异常解释器分离真实服务峰与传输批次峰并输出来源质量反馈 | 表 `source_profile / clearing_batch / activity_record`；`services/activity.py`；页面 **活动时间重建**（路由 `/activity`）；接口 `/api/activity/*`；验收 `activity_*` 共 5 项 |
 | 来源账：来源系统 / 业务有效时间 / 接收时间 / 撤销更正 / 可引用字段 | 表 `source_record`；页面 **来源账**；每条业务记录均挂 `source_id`，支持更正链 `supersedes` |
 | 身份解析分级：伪标识、有效期内专业凭证=强；共享电话/地址/代办人=弱候选，不自动合并 | `services/identity.py`；页面 **身份解析**；弱证据仅 `pending`，可人工确认/驳回并产生簇新版本+快照 |
 | 边保存具体依据、来源与支持/反驳方向 | 表 `graph_edge`：`basis / source_codes / stance(support/refute/neutral) / status(active/negated)` |
@@ -31,7 +32,7 @@
 | 带时间切分验证的图模型：地区/机构偏差校准、高分可追溯路径与反证 | `services/graphmodel.py`（纯 Python 逻辑回归，train≤2026-01-31 / val=2026-02；验证集指标真实计算；地区+机构类型残差校准） |
 | 规则与模型在 P1 上展示**相同支持链** | 模型结果直接回传规则引擎的 `support_chain` 为 `trace_chain_uids`；验收 `same_chain_and_rank` |
 | 变更（身份裁定/政策有效日/退费更正）→ 新快照 + 标出受影响案件；旧材料保留原判断来源 | `routers/identity.py`、`routers/snapshots.py`；`case_judgment` 不可变版本，旧版本永久指向旧快照 |
-| 虚构网络四类验收原型 | 见下节，**总览页“一键验收”** 或 `GET /api/acceptance/run`（10 项断言） |
+| 虚构网络四类验收原型 | 见下节，**总览页“一键验收”** 或 `GET /api/acceptance/run`（**15 项断言**：原 10 项 + 活动时间重建 5 项） |
 
 ### 虚构验收网络（全部为虚构数据）
 
@@ -54,7 +55,7 @@
 ## 2. 一键 Docker 启动（推荐验收方式）
 
 ```bash
-cd /workspace/85
+cd /workspace/85-feature-4
 docker compose up -d --build
 # 等待 app 健康（首次会自动建表并播种虚构网络）
 docker compose ps
@@ -84,18 +85,20 @@ PGPASSWORD=ccdev /opt/postgresql-18/bin/psql -h 127.0.0.1 -U ccdev -d ccdev \
 ### 3.2 后端（Python 3.12 + venv）
 
 ```bash
-cd /workspace/85/backend
-/opt/python-3.12/bin/python3 -m venv /workspace/85/.venv
-/workspace/85/.venv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+cd /workspace/85-feature-4/backend
+/opt/python-3.12/bin/python3 -m venv /workspace/85-feature-4/.venv
+/workspace/85-feature-4/.venv/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
   -r requirements.txt
 
 # 初始化/重置播种（也可跳过：API 启动时空库会自动播种）
-/workspace/85/.venv/bin/python -m app.seed
+DATABASE_URL='postgresql+psycopg2://ccdev:ccdev@127.0.0.1:5432/riskgraph' \
+  /workspace/85-feature-4/.venv/bin/python -m app.seed
 
 # 启动（本地开发端口与 vite proxy 对齐为 8000）
+# STATIC_DIR 可不设：config.py 默认解析到仓库根 frontend/dist
 DATABASE_URL='postgresql+psycopg2://ccdev:ccdev@127.0.0.1:5432/riskgraph' \
-STATIC_DIR=/workspace/85/frontend/dist \
-/workspace/85/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+STATIC_DIR=/workspace/85-feature-4/frontend/dist \
+/workspace/85-feature-4/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 - 健康检查：<http://127.0.0.1:8000/api/health>
@@ -104,8 +107,9 @@ STATIC_DIR=/workspace/85/frontend/dist \
 ### 3.3 前端（Node 22）
 
 ```bash
-cd /workspace/85/frontend
+cd /workspace/85-feature-4/frontend
 /opt/node-22/bin/npm install --registry=https://registry.npmmirror.com
+# 若容器内 ~/.npm 为 root 所有导致 EACCES，可加：--cache /tmp/npmcache
 
 # 方式 A：开发服务器（/api 代理到 127.0.0.1:8000，可用 API_TARGET 覆盖）
 /opt/node-22/bin/npm run dev        # http://localhost:5173
@@ -125,7 +129,7 @@ cd /workspace/85/frontend
 
 ## 4. 本题验证方式与已执行结论
 
-### 4.1 一键验收（10 项断言，全部通过）
+### 4.1 一键验收（15 项断言，全部通过）
 
 - 界面：**总览 / 验收剧本 → 运行验收**（或登录后 `GET /api/acceptance/run`）。
 - 命令行实测：
@@ -137,11 +141,11 @@ TOKEN=$(curl -s -X POST http://127.0.0.1:8000/api/auth/login \
 curl -s http://127.0.0.1:8000/api/acceptance/run -H "Authorization: Bearer $TOKEN"
 ```
 
-开发过程中的真实执行结果（服务层与 HTTP 层均跑过）：
+开发过程中的真实执行结果（服务层与 HTTP 层均跑过；下列为本次新增功能后的实测）：
 
 ```
-OVERALL True 10 / 10
-PASS source_ledger            # 103 条来源、0 缺引用、SRC-ST5B 更正链
+OVERALL True 15 / 15
+PASS source_ledger            # 106 条来源、0 缺引用、SRC-ST5B 更正链
 PASS identity_grading         # P1/P1B 同强簇；P2/P3 异簇，IE-03 pending
 PASS p1_chain                 # 同日/重叠28/同一给药期/停诊 + 7 条核心边
 PASS same_chain_and_rank      # trace_chain_uids == support_chain；规则/模型同目标均 C-001 第一
@@ -151,11 +155,75 @@ PASS p5_appeal_return         # APP1 upheld/returned，C-004 closed_returned
 PASS restricted_expansion     # 2 跳 / 180 天，SCH1/PH1/PH2 可达，无越窗边
 PASS high_amount_gate         # C-001 被拒、C-007 授权扩展并可达 bed 节点
 PASS snapshot_immutable       # 快照#1 四要素齐全，判断 v1@snap1 带免责声明
+# —— 本次“服务活动时间重建”新增 5 项 ——
+PASS activity_profiles            # A/B/C 画像 + 五要素齐全；就诊/结算两类均 >60 行
+PASS activity_peak_separation     # B 3/16 接收87==WE2清单，当日真实服务14，衰减0.839，真峰3/13=32
+PASS activity_two_methods         # 反卷积与批次对账同估31天；总量均=477；批次点区间更窄
+PASS activity_c_no_batch_guard    # C no_batch_no；跨机构套用 B 日历被 guard 拒绝
+PASS activity_unknown_preserved   # 7 笔服务时间缺失只入 unknown，对所有服务日贡献=0，不落到3/31
 ```
+
+### 4.1.1 服务活动时间重建：样例与人工核验点（本次新增，已实际执行）
+
+新增页面 **左侧导航「活动时间重建」**（`/#/activity`，任意账号可登录访问），或直接调 API。
+样例目标期间固定为 **2026-03-01 ~ 2026-03-31**，三家虚构机构：
+
+| 机构 | 报送机制 | 延迟模型（实测，就诊口径） | 批次对账 | 重建效果 |
+| --- | --- | --- | --- | --- |
+| **H-A** | 每个服务日当晚稳定直报 | 平均延迟 **0 天**、当日达 100%，点核 `p(0)=1` | 每日批次，完整 | 反卷积/对账均**精确**；另有 **7 笔**月末签收但**服务时间缺失** |
+| **H-B** | **周四~周日四天压到周一**（另有周三批、月末 3/26–31 合并清算批） | 均迟 **2.01 天**、支撑 0–5 天，固定压批日历使“混合延迟核”被误设 | 8 个批次清单全部四方对平、序号连续 | **批次对账精确（477 笔，点区间）**；通用反卷积仅近似且自动标 `low` 可信、给宽区间 |
+| **H-C** | **无批次号**，但服务发生时间可靠 | 平滑 0–2 天短尾（0.6/0.3/0.1 拆分），回测日 MAE≈1.1 | **不可用 `no_batch_no`** | 直接按服务时点精确；自身核反卷积高可信 |
+
+已用 HTTP + 服务层真实跑过、可复算的关键数字（`kind=visit`）：
+
+- **接收日峰值如何改变（全机构）**：原始签收口径最高峰 **2026-03-31 = 117 笔**（月末清算批 + A 未知服务时间调整批），
+  该日真实服务仅 **42 笔**，峰值当日虚高衰减 **64.1%**；按服务时点重建后最高峰变为
+  **2026-03-13 = 96 笔**（一次真实服务高峰，3/12=93）。
+- **B 机构更典型**：**2026-03-16（周一）签收 87 笔**，恰等于批次 `QPB-WE2-03` 清单中 3/12–3/15 四天就诊量之和；
+  而 3/16 当天真实服务只有 **14 笔**，衰减 **83.9%**；真实服务峰在 **3/13（32 笔）**，且被压到 3/16 签收。
+  → 接收日的“周一高峰”是**传输批次峰**，3/12–13 的高峰才是**真实服务峰**，异常解释器分别成组输出。
+- **两条方法估计同一目标期间并报告不确定范围（B，31 天）**：
+  - 延迟反卷积：总量估计 **477**（质量守恒，=有服务时间真值），区间约 **[176, 796]**（核误设→宽，并标低可信）；
+  - 清算批次对账：**477，区间 [477,477]**（清单完整、四方对平，高精度）。
+  - 全机构反卷积总量 **1431 ∈ [769, 2118]**，区间上限另含 **7** 笔未知服务时间。
+- **C 为何不能套用 B 的批次校正**：C 的 `activity_record.batch_no` 全为 `NULL`、无 `clearing_batch` 清单，
+  没有与 B 批次清单连接的键；且“周末四天→周一”是 **B 机构特定的压批日历**，不是通用延迟规律，照搬会把
+  B 的服务日结构虚构到 C 头上。接口对 `org=H-C` 返回 `batch.available=false / reason_code=no_batch_no`，
+  服务层 `why_cannot_transfer_batch('H-B', C)` 显式返回 `allowed=false / target_has_no_batch_no`（验收 `activity_c_no_batch_guard`）。
+- **缺失服务时间不分配到月末**：A 有 3 行 `ACT-A-UNK-1..3` 共 **7 笔**，均于 **2026-03-31 19:30 签收**但
+  `service_date=NULL`。它们进入 `unknown.units=7 / by_signoff={'2026-03-31':7}`，对所有服务日序列贡献为 **0**；
+  `direct` 合计 = `known_service_units=1431`，而 `all_units=1438`。系统**不会**把这 7 笔计入 3/31 服务量，
+  只在总量不确定区间上界中体现“可能属于目标期”。
+
+相关接口（均需 Bearer 登录）：
+
+```bash
+B=http://127.0.0.1:8000   # TOKEN 取上一步登录返回的 token
+curl "$B/api/activity/profiles"                 # 三画像 + 延迟直方图 + 质量反馈 + 跨机构套用 guard
+curl "$B/api/activity/reconstruct?org=ALL&kind=visit"      # 曲线/两法/峰值分离 主编排
+curl "$B/api/activity/reconstruct?org=H-B&kind=visit"       # 单机构：B 批次精确 vs 反卷积宽区间
+curl "$B/api/activity/reconstruct?org=H-C&kind=settlement"  # 结算口径同样可用
+curl "$B/api/activity/batches?org=H-B"          # 清算批次清单与对账状态/manifest
+curl "$B/api/activity/records?unknown_only=true"          # 五要素明细 / 未知服务时间
+```
+
+UI 核验路径：登录 → 左侧 **活动时间重建** → 默认“全部/就诊”即可看到红柱（签收）与蓝线（服务时点）错位、
+顶部 KPI 的衰减与峰位移；机构切到 **H-B** 勾选“批次对账线”可见其与蓝线完全重合，勾选“反卷积+区间”可见宽紫带与
+低可信标注；切到 **H-C** 中部批次卡片显示“不可用/无批次号”及禁止套用 B 的说明；底部“来源明细”打开
+“只看服务时间缺失”可见 3 行红色“未知·不分配”。
 
 ### 4.2 已实际执行的其他验证
 
-- `python -m app.seed` 成功：`15 persons, 103 source records, 115 nodes, 267 edges, snapshot #1`。
+- `python -m app.seed` 成功：`15 persons, 106 source records, 115 nodes, 267 edges, snapshot #1`
+  （新增活动重建的 3 条报送来源 SourceRecord 与 `source_profile=3 / clearing_batch=40 / activity_record=313`，
+  其中明细 `visit=158 / settlement=155`）。
+- **空库首启链路实测（与 Docker 完全一致）**：`DROP/CREATE DATABASE riskgraph` 成 0 表空库后启动 uvicorn，
+  startup `create_all` 建新三表并 `run_seed(reset=False)` 自动播种成功；随后 HTTP 登录、
+  `GET /api/acceptance/run` 实测 **15/15 全绿**，`GET /` 与新构建的 `assets/index-*.js` 均 200。
+- **活动时间重建（本次新增）实际执行**：服务层逐机构复算 + HTTP（admin/auditor 登录、未登录 401）+
+  验收 5 断言均通过；`npm run build` 成功产出 `ActivityTime-*.js (≈24.2 kB)`。本容器**没有无头浏览器**，
+  因此未对新页面做真实点击/截图；已用生产构建（模板与 `<script setup>` 全部编译、导入解析通过）+
+  接口返回结构核对 + 空数据守卫审查替代，建议按 4.1.1 末尾路径做一次人工目检。
 - 遍历全部 GET API 与 **8 个案件详情**均 200，投影子图 5~11 节点 / 6~18 边，每案 6 条反证核查。
 - 权限：`auditor` 仅列出 `['C-001','C-004','C-006']`，访问 `GET /api/cases/C-002` 返回 **403**。
 - 变更流（实测）：驳回 IE-03 → 快照 #2/身份簇 v2/影响 C-002；
@@ -183,30 +251,37 @@ PASS snapshot_immutable       # 快照#1 四要素齐全，判断 v1@snap1 带�
 6. **案件投影**：提交核查状态；切换判断版本；用 `auditor/audit123` 重新登录验证只能看朝阳案件。
 7. **快照复演**：查看 #1 冻结图与政策/身份版本；执行政策换版或 ST12 退费，查看新快照、Diff 与受影响案件，
    再回 C-005/C-008 对比 v1 与新判断。
+8. **活动时间重建（本题新增）**：左侧进入该页，默认全部/就诊即可看到红柱（签收）与蓝线（服务时点）错位、
+   KPI 显示 raw peak `2026-03-31 117 → 当日服务 42（衰减 64%）`、真峰移到 `03-13 96`；机构切 **H-B**
+   可见 `03-16 87→14（衰减 84%）`，勾选“批次对账线”与蓝线重合、勾“反卷积+区间”见宽紫带与低可信标注；
+   切 **H-C** 见批次方法“不可用/无批次号”及禁止套用 B 的说明；底部“来源明细”打开“只看服务时间缺失”，
+   可见 3 行共 7 笔红色“未知·不分配”。就诊/结算切换、清算批次 manifest 展开均可用。
 
 ---
 
 ## 5. 目录结构
 
 ```
-/workspace/85
+/workspace/85-feature-4
 ├── Dockerfile                 # 多阶段：node22 构建 → python3.12 托管
 ├── docker-compose.yml        # db(postgres:16) + app，健康依赖
 ├── README.md
 ├── backend/
 │   ├── requirements.txt
 │   └── app/
-│       ├── main.py            # FastAPI、启动播种、静态托管
+│       ├── main.py            # FastAPI、启动播种、静态托管、挂载 activity 路由
 │       ├── config.py database.py models.py security.py acceptance.py seed.py
-│       ├── routers/           # auth/sources/identity/graph/patterns/cases/snapshots/tools
-│       └── services/          # identity/graph_builder/patterns/counterevidence/
+│       ├── routers/           # auth/sources/activity/identity/graph/patterns/cases/snapshots/tools
+│       └── services/          # activity(延迟核/R-L反卷积/批次对账/峰值分离/质量反馈)
+│                              # identity/graph_builder/patterns/counterevidence/
 │                              # graphmodel/expansion/projection/snapshot/ranking/rejudge
 └── frontend/
     ├── vite.config.js package.json
     └── src/
         ├── App.vue AppLayout.vue main.js router.js api.js store.js styles.css
-        ├── components/GraphCanvas.vue   # 自研 SVG 力导向图（支持链高亮/弱边终端/否定边）
-        └── pages/             # Login/Dashboard/Sources/Identity/Explorer/Patterns/
+        ├── components/GraphCanvas.vue          # 自研 SVG 力导向图
+        ├── components/ActivityCurveChart.vue   # 自研 SVG 接收柱+服务线+不确定带
+        └── pages/             # Login/Dashboard/Sources/ActivityTime/Identity/Explorer/Patterns/
                                # Cases/CaseDetail/Counter/Snapshots
 ```
 
@@ -219,6 +294,10 @@ GET  /api/acceptance/run
 POST /api/meta/reset                         (admin)
 GET  /api/sources?source_system=&record_type=&status=&q=
 GET  /api/sources/{code}
+GET  /api/activity/profiles                         # A/B/C 画像+延迟直方图+质量反馈+guard
+GET  /api/activity/reconstruct?org=ALL|H-A|H-B|H-C&kind=visit|settlement
+GET  /api/activity/batches?org=                     # 清算批次清单/manifest/对账状态
+GET  /api/activity/records?org=&kind=&unknown_only= # 五要素明细
 GET  /api/identity/evidence | /clusters
 POST /api/identity/evidence/{code}/adjudicate
 GET  /api/graph/expand?start_type=beneficiary|claim&start_code=P1&max_hops=2&window_days=180

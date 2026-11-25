@@ -9,6 +9,7 @@ const routes = [
       { path: '', redirect: '/dashboard' },
       { path: 'dashboard', component: () => import('./pages/Dashboard.vue'), meta: { title: '总览与验收剧本' } },
       { path: 'sources', component: () => import('./pages/Sources.vue'), meta: { title: '来源账' } },
+      { path: 'activity', component: () => import('./pages/ActivityTime.vue'), meta: { title: '服务活动时间重建' } },
       { path: 'identity', component: () => import('./pages/Identity.vue'), meta: { title: '身份解析' } },
       { path: 'explorer', component: () => import('./pages/Explorer.vue'), meta: { title: '受限图扩展' } },
       { path: 'patterns', component: () => import('./pages/Patterns.vue'), meta: { title: '模式与排序' } },

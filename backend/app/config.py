@@ -13,8 +13,12 @@ class Settings:
     # 初始快照/分析截止日（虚构网络的业务截止日，保证 180 天窗确定可复演）
     DEFAULT_CUTOFF = os.getenv("DEFAULT_CUTOFF", "2026-03-31")
     TOKEN_TTL_HOURS = int(os.getenv("TOKEN_TTL_HOURS", "12"))
-    # 前端构建产物（单镜像部署时由 FastAPI 托管）
-    STATIC_DIR = os.getenv("STATIC_DIR", "/workspace/85/frontend/dist")
+    # 前端构建产物（单镜像部署时由 FastAPI 托管）。
+    # 默认解析到仓库根的 frontend/dist（backend/app/config.py 向上两级），
+    # 容器与显式 STATIC_DIR 环境变量仍会覆盖。
+    _REPO_DIST = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "frontend", "dist"))
+    STATIC_DIR = os.getenv("STATIC_DIR", _REPO_DIST)
 
 
 settings = Settings()
